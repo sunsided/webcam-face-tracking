@@ -75,7 +75,8 @@ struct Shared {
     raw_gaze: Option<[f32; 2]>,
     gaze_gain: f32,
     observation: Option<Observation>,
-    /// The newest observation, kept for calibration.
+    /// The newest observation, kept for calibration (a web-only API).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     last_observation: Option<Observation>,
     face_lost: bool,
     /// The eye point used for the last frame, and whether it came from the tracker.
@@ -174,8 +175,31 @@ impl Game for WindowRoom {
         if ctx.input.key_pressed(Key::Escape) {
             ctx.quit();
         }
-        self.time += dt;
         self.frames += 1;
+        // `FACE_WINDOW_SWEEP=dir`: freeze the scene, move the eye once around a loop in front
+        // of the window and save a frame per step (for the README animation), then quit.
+        #[cfg(not(target_arch = "wasm32"))]
+        let sweeping = std::env::var("FACE_WINDOW_SWEEP").ok();
+        #[cfg(target_arch = "wasm32")]
+        let sweeping: Option<String> = None;
+        if let Some(dir) = &sweeping {
+            const STEPS: u32 = 48;
+            const WARMUP: u32 = 30;
+            self.time = 2.0;
+            let step = self.frames.saturating_sub(WARMUP);
+            if step >= STEPS {
+                ctx.quit();
+            }
+            let a = std::f32::consts::TAU * step as f32 / STEPS as f32;
+            let w = self.room.half_w;
+            pin_eye(Some([w * 1.2 * a.sin(), w * 0.35 * (2.0 * a).sin(), 0.55]));
+            if self.frames >= WARMUP {
+                ctx.gfx
+                    .request_screenshot(std::path::Path::new(dir).join(format!("{step:03}.png")));
+            }
+        } else {
+            self.time += dt;
+        }
         // `FACE_WINDOW_SHOT=out.png`: save a frame once things settled, then quit.
         #[cfg(not(target_arch = "wasm32"))]
         if let Ok(path) = std::env::var("FACE_WINDOW_SHOT") {
@@ -399,6 +423,11 @@ fn window_size(ctx: &Context) -> [f32; 2] {
 /// Pin the eye to a fixed point, or `None` to follow the tracker or mouse again.
 pub fn pin_eye(eye: Option<Vec3>) {
     with_shared(|s| s.pinned_eye = eye);
+}
+
+/// Mirror the view's parallax per axis (see `web::set_view_invert`).
+pub fn set_view_invert(x: bool, y: bool) {
+    with_shared(|s| s.view_invert = [x, y]);
 }
 
 /// Light the room with a spotlight instead of a lamp (see `web::set_flashlight`).

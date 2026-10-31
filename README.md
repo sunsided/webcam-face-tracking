@@ -2,7 +2,9 @@
 
 A 3D room behind your screen: a webcam tracks your face, the room is re-projected from where your eyes are, and a light at your head throws the objects' shadows onto the walls. The renderer is Rust on [game-toolkit](https://github.com/sunsided/game-toolkit) and wgpu, compiled to WebAssembly; the page around it is a small SvelteKit app that runs MediaPipe's Face Landmarker in a worker.
 
-![The room with the lamp at the viewer's head](docs/lamp.png)
+![The room re-projected while the head moves in a loop in front of the screen](docs/head-sweep.webp)
+
+The head moves in a loop in front of the screen (the inset shows where, relative to the screen) and the room is re-projected from there, with the lamp, and so the shadows, moving along. Seen from anywhere but the position it was rendered for, every frame looks skewed: that's the effect doing its job. The frames come from the native build (`FACE_WINDOW_PHYSICAL=1 FACE_WINDOW_SWEEP=<dir> cargo run --release`).
 
 This is based on Daniel Habib's [True3D Window Mode](https://danielhabib.substack.com/p/a-simpler-way-to-watch-3d), which turns a laptop screen into a window onto a 3D scene with nothing but the webcam, and that is also where I want to take it. The idea itself goes back at least to Johnny Chung Lee's Wii Remote head tracking in 2007. What I added on top so far is the light: with the room lit from where your face is, every lean moves the shadows too.
 

@@ -409,6 +409,13 @@
 			<p class="hint">Jittery: more smoothing, less prediction. Laggy: the other way round.</p>
 		</fieldset>
 		<label>
+			View
+			<select bind:value={settings.viewFollows}>
+				<option value={true}>Window: room follows your head</option>
+				<option value={false}>Fixed room: only the light moves</option>
+			</select>
+		</label>
+		<label>
 			Light
 			<select bind:value={settings.lightMode}>
 				<option value="lamp">Lamp at your head</option>
@@ -422,7 +429,6 @@
 			</label>
 			<p class="hint">Look at the screen center and press c to calibrate where "straight ahead" is.</p>
 		{/if}
-				<label class="check"><input type="checkbox" bind:checked={settings.viewFollows} /> Room re-projects with your head (off: only the light follows)</label>
 		<label class="check"><input type="checkbox" bind:checked={settings.mouseMode} /> Mouse drives the head (wheel: distance)</label>
 		<label class="check"><input type="checkbox" bind:checked={settings.showVideo} /> Show camera preview</label>
 		<div class="row">

@@ -10,7 +10,9 @@ This is based on Daniel Habib's [True3D Window Mode](https://danielhabib.substac
 
 ## Running it
 
-You'll need Rust with the `wasm32-unknown-unknown` target, [`wasm-pack`](https://github.com/rustwasm/wasm-pack), [go-task](https://taskfile.dev) and Node with corepack (yarn 4 is pinned in `web/package.json`). Then:
+The demo runs at **[sunsided.github.io/webcam-face-tracking](https://sunsided.github.io/webcam-face-tracking/)**, built from `main` by a GitHub Actions workflow. Your camera frames never leave the browser: face detection runs locally in a worker.
+
+To build it yourself, you'll need Rust with the `wasm32-unknown-unknown` target, [`wasm-pack`](https://github.com/rustwasm/wasm-pack), [go-task](https://taskfile.dev) and Node with corepack (yarn 4 is pinned in `web/package.json`). Then:
 
 ```sh
 task dev     # build the renderer, install and vendor MediaPipe, serve the page with Vite

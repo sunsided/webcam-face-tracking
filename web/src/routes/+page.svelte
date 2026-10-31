@@ -4,6 +4,8 @@
 	import init, * as room from '$lib/wasm/face_window.js';
 	import { listCameras, loadLandmarker, openCamera, track, type Eyes } from '$lib/tracker';
 	import { reset, save, settings } from '$lib/settings.svelte';
+	import { devLog } from '$lib/devlog';
+	import { CARD_MM, diagonalFromSpan, guessDiagonal, pitch, screenKey } from '$lib/screens';
 
 	let canvas: HTMLCanvasElement;
 	let video = $state<HTMLVideoElement>();
@@ -15,8 +17,26 @@
 	let cameras = $state<MediaDeviceInfo[]>([]);
 	let cameraOn = $state(false);
 	let trackFps = $state(0);
+	let detectMs = $state(0);
+	let renderFps = $state(0);
+	let delegate = $state('');
+	/** `t` starts a few seconds of per-measurement logging, for tuning the filter. */
+	let traceUntil = 0;
+	let ageTotal = 0;
+	let ageCount = 0;
 	let head = $state([0, 0, 0, 0]);
 	let windowCm = $state([0, 0]);
+	let screenRes = $state('');
+	let currentScreen = $state('');
+	/** The current screen's diagonal: measured or entered, else guessed. */
+	let diagonal = $derived(settings.screens[currentScreen] ?? guessDiagonal());
+	let measured = $derived(currentScreen in settings.screens);
+	/** Card-measuring overlay: the on-screen card width in CSS pixels, or 0 when closed. */
+	let cardPx = $state(0);
+	let distanceCm = $state(50);
+	let calibrateNote = $state('');
+	/** Implied pixel density, when it's implausible for the entered diagonal. */
+	let dpiWarning = $state(0);
 
 	let stopTracking: (() => void) | undefined;
 	let stream: MediaStream | undefined;
@@ -26,7 +46,8 @@
 	function updateGeometry() {
 		if (!ready || !canvas) return;
 		// Meters per CSS pixel, from the diagonal and the screen's CSS resolution.
-		const pitch = (settings.diagonalIn * 0.0254) / Math.hypot(screen.width, screen.height);
+		currentScreen = screenKey();
+		const mPerPx = pitch(diagonal);
 		const r = canvas.getBoundingClientRect();
 		// Canvas center in screen CSS pixels. Browser chrome sits above the viewport; in
 		// fullscreen all of these offsets are zero.
@@ -34,19 +55,29 @@
 		const chromeTop = window.outerHeight - window.innerHeight;
 		const cx = window.screenX - (s.availLeft ?? 0) + r.left + r.width / 2;
 		const cy = window.screenY - (s.availTop ?? 0) + chromeTop + r.top + r.height / 2;
-		room.set_window_size(r.width * pitch, r.height * pitch);
+		room.set_window_size(r.width * mPerPx, r.height * mPerPx);
 		// The webcam sits centered above the screen's top edge.
 		room.set_camera(
 			settings.cameraFovDeg,
-			(screen.width / 2 - cx) * pitch,
-			cy * pitch + settings.cameraAboveCm / 100,
+			(screen.width / 2 - cx) * mPerPx,
+			cy * mPerPx + settings.cameraAboveCm / 100,
 			0
 		);
 		room.set_ipd(settings.ipdMm / 1000);
 		const [lx, ly, lz] = settings.lightCm;
 		room.set_light_offset(lx / 100, ly / 100, lz / 100);
 		room.set_mouse_mode(settings.mouseMode);
-		windowCm = [r.width * pitch * 100, r.height * pitch * 100];
+		room.set_view_follows(settings.viewFollows);
+		room.set_view_invert(settings.flipX, settings.flipY);
+		room.set_tracking(settings.smoothing, settings.predictionMs);
+		const [nx, ny, ngx, ngy] = settings.neutral;
+		room.set_neutral(nx, ny, ngx, ngy);
+		room.set_flashlight(settings.lightMode === 'flashlight', settings.gazeGain);
+		windowCm = [r.width * mPerPx * 100, r.height * mPerPx * 100];
+		screenRes = `${screen.width}×${screen.height}`;
+		// Device pixels per inch; desktop and laptop panels sit roughly between 90 and 300.
+		const dpi = (Math.hypot(screen.width, screen.height) * devicePixelRatio) / diagonal;
+		dpiWarning = dpi > 300 || dpi < 70 ? Math.round(dpi) : 0;
 	}
 
 	function drawEyes(e: Eyes | null) {
@@ -76,12 +107,37 @@
 			if (active) settings.cameraId = active;
 			save();
 			status = 'loading face model…';
-			landmarker ??= await loadLandmarker(base);
+			if (landmarker && landmarker.delegate !== settings.detector) {
+				landmarker.worker.terminate();
+				landmarker = undefined;
+			}
+			landmarker ??= await loadLandmarker(base, settings.detector);
+			delegate = landmarker.delegate;
 			cameraOn = true;
 			status = 'looking for a face…';
 			stopTracking = track(video, landmarker, {
 				onEyes: (e) => {
-					room.push_eyes(e.left[0], e.left[1], e.right[0], e.right[1], e.width, e.height, e.time);
+					const age = performance.now() - e.time;
+					ageTotal += age;
+					ageCount++;
+					if (performance.now() < traceUntil) {
+						const h = Array.from(room.head()).slice(0, 3).map(fmt).join(',');
+						devLog(
+							`m age=${age.toFixed(0)}ms L=${e.left.map((v) => v.toFixed(1))} ` +
+								`R=${e.right.map((v) => v.toFixed(1))} gaze=${e.gaze.map((v) => v.toFixed(3))} head=${h}cm`
+						);
+					}
+					room.push_eyes(
+						e.left[0],
+						e.left[1],
+						e.right[0],
+						e.right[1],
+						e.width,
+						e.height,
+						e.gaze[0],
+						e.gaze[1],
+						e.time
+					);
 					if (settings.showVideo) drawEyes(e);
 					status = 'tracking';
 				},
@@ -90,7 +146,10 @@
 					drawEyes(null);
 					status = 'face lost';
 				},
-				onFps: (fps) => (trackFps = fps)
+				onStats: (fps, ms) => {
+					trackFps = fps;
+					detectMs = ms;
+				}
 			});
 		} catch (e) {
 			status = `camera error: ${e instanceof Error ? e.message : e}`;
@@ -105,6 +164,31 @@
 		stream = undefined;
 		cameraOn = false;
 		trackFps = 0;
+		detectMs = 0;
+	}
+
+	function openCard() {
+		cardPx = CARD_MM.w / 1000 / pitch(diagonal);
+	}
+
+	function saveCard() {
+		settings.screens[currentScreen] = Math.round(diagonalFromSpan(cardPx, CARD_MM.w) * 10) / 10;
+		cardPx = 0;
+	}
+
+	function calibrateDistance() {
+		const fov = room.calibrate_distance(distanceCm / 100);
+		if (fov === undefined) {
+			calibrateNote = 'No face tracked yet.';
+			return;
+		}
+		settings.cameraFovDeg = Math.round(fov * 10) / 10;
+		calibrateNote = `Camera FOV set to ${settings.cameraFovDeg}°. Measure the distance from your eyes to the screen.`;
+	}
+
+	function centerView() {
+		const n = room.center_view();
+		if (n) settings.neutral = [n[0], n[1], n[2], n[3]];
 	}
 
 	function fullscreen() {
@@ -116,6 +200,11 @@
 		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
 		if (e.key === 'h') panelOpen = !panelOpen;
 		if (e.key === 'f') fullscreen();
+		if (e.key === 'c' && cameraOn) centerView();
+		if (e.key === 't') {
+			traceUntil = performance.now() + 5000;
+			devLog('trace: 5 s of measurements');
+		}
 	}
 
 	onMount(() => {
@@ -125,6 +214,13 @@
 				if (disposed) return;
 				ready = true;
 				status = 'renderer ready';
+				// The adapter is picked asynchronously after init; report it once it is known.
+				const report = setInterval(() => {
+					const info = room.renderer_info();
+					if (!info) return;
+					clearInterval(report);
+					devLog(`renderer: ${info}, dpr=${devicePixelRatio}`);
+				}, 200);
 				updateGeometry();
 			},
 			(e) => (status = `renderer failed: ${e}`)
@@ -135,6 +231,29 @@
 		ro.observe(canvas);
 		// Window moves don't fire events; re-check where the canvas sits now and then.
 		const geo = setInterval(updateGeometry, 1000);
+		// Count animation frames: the renderer draws once per frame, so this is its rate.
+		let rafFrames = 0;
+		let raf = requestAnimationFrame(function count() {
+			rafFrames++;
+			raf = requestAnimationFrame(count);
+		});
+		const fps = setInterval(() => {
+			renderFps = rafFrames;
+			rafFrames = 0;
+			if (!ready) return;
+			const [x, y, z, tracked] = Array.from(room.head());
+			const age = ageCount ? ageTotal / ageCount : 0;
+			ageTotal = ageCount = 0;
+			const cam = cameraOn
+				? ` track=${trackFps.toFixed(1)}fps detect=${detectMs.toFixed(1)}ms(${delegate}) age=${age.toFixed(0)}ms`
+				: '';
+			devLog(
+				`render=${renderFps}fps@${canvas.width}x${canvas.height} ` +
+					`window=${windowCm[0].toFixed(1)}x${windowCm[1].toFixed(1)}cm screen=${screenRes}@${diagonal}in${measured ? '' : '(guess)'}` +
+					` smooth=${settings.smoothing} pred=${settings.predictionMs}ms light=${settings.lightMode}${cam} eye=${fmt(x)},${fmt(y)},${fmt(z)}cm ` +
+					`${tracked > 0 ? 'tracked' : 'idle'} status="${status}"`
+			);
+		}, 1000);
 		const poll = setInterval(() => {
 			if (ready) head = Array.from(room.head());
 		}, 100);
@@ -143,9 +262,14 @@
 			ro.disconnect();
 			clearInterval(geo);
 			clearInterval(poll);
+			clearInterval(fps);
+			cancelAnimationFrame(raf);
 			stopCamera();
 		};
 	});
+
+	$effect(() => devLog(`status: ${status}`));
+
 
 	// Re-send calibration whenever a setting changes.
 	$effect(() => {
@@ -170,7 +294,10 @@
 	</header>
 
 	{#if panelOpen}
-		<p class="status">{status}{trackFps ? ` · ${trackFps.toFixed(0)} fps` : ''}</p>
+		<p class="status">{status}</p>
+		<p class="perf">
+			render {renderFps.toFixed(0)} fps{#if cameraOn} · track {trackFps.toFixed(0)} fps · detect {detectMs.toFixed(1)} ms ({delegate}){/if}
+		</p>
 		<p class="head">
 			eye {fmt(head[0])}, {fmt(head[1])}, {fmt(head[2])} cm
 			<span class:on={head[3] > 0}>{head[3] > 0 ? 'tracked' : 'idle'}</span>
@@ -207,9 +334,43 @@
 	{#if panelOpen}
 		<fieldset>
 			<legend>Calibration</legend>
-			<label>Screen diagonal (in) <input type="number" step="0.1" bind:value={settings.diagonalIn} /></label>
-			<p class="hint">canvas ≈ {windowCm[0].toFixed(1)} × {windowCm[1].toFixed(1)} cm</p>
-			<label>Camera FOV (°) <input type="number" step="1" bind:value={settings.cameraFovDeg} /></label>
+			<div class="row">
+				<button onclick={centerView} disabled={!cameraOn} title="Sit as usual, then click (c)">Center view here</button>
+				<button class="ghost" onclick={() => (settings.neutral = [0, 0, 0, 0])}>Physical</button>
+			</div>
+			<p class="hint">
+				Center: {fmt(settings.neutral[0])}, {fmt(settings.neutral[1])} cm. "Physical" makes the screen center
+				the straight-on view, which is exact but means looking down from above a laptop screen.
+			</p>
+			<label>
+				Screen diagonal (in)
+				<input
+					type="number"
+					step="0.1"
+					value={diagonal}
+					onchange={(e) => (settings.screens[currentScreen] = +e.currentTarget.value)}
+				/>
+			</label>
+			<div class="row">
+				<button onclick={openCard} title="Match a bank card against the screen">Measure with a card</button>
+				{#if !measured}<span class="hint">guessed</span>{/if}
+			</div>
+			{#if dpiWarning}
+				<p class="warn">
+					{screenRes} at {diagonal}" would be {dpiWarning} px per inch, which is unlikely.
+					Enter this screen's real diagonal.
+				</p>
+			{/if}
+			<p class="hint">
+				Diagonal of the screen this window is on ({screenRes}). Canvas ≈ {windowCm[0].toFixed(1)} ×
+				{windowCm[1].toFixed(1)} cm; if that's off, the room swings too much or too little.
+			</p>
+			<label>Camera FOV (°) <input type="number" step="0.5" bind:value={settings.cameraFovDeg} /></label>
+			<div class="row">
+				<label>I sit <input type="number" step="1" bind:value={distanceCm} /> cm away</label>
+				<button onclick={calibrateDistance} disabled={!cameraOn} title="Sets the camera FOV">Calibrate</button>
+			</div>
+			{#if calibrateNote}<p class="hint">{calibrateNote}</p>{/if}
 			<label>Camera above screen (cm) <input type="number" step="0.5" bind:value={settings.cameraAboveCm} /></label>
 			<label>Eye distance (mm) <input type="number" step="1" bind:value={settings.ipdMm} /></label>
 		</fieldset>
@@ -224,14 +385,75 @@
 			<p class="hint">At 0, 0, 0 every shadow hides behind its object.</p>
 		</fieldset>
 
+		<div class="row">
+			<label class="check"><input type="checkbox" bind:checked={settings.flipX} /> Invert view left/right</label>
+			<label class="check"><input type="checkbox" bind:checked={settings.flipY} /> Invert view up/down</label>
+		</div>
+		<label>
+			Face model runs on
+			<select bind:value={settings.detector} onchange={() => cameraOn && startCamera()}>
+				<option value="CPU">CPU (WASM)</option>
+				<option value="GPU">GPU (WebGL)</option>
+			</select>
+		</label>
+		<fieldset>
+			<legend>Tracking feel</legend>
+			<label>
+				Smoothing {settings.smoothing.toFixed(2)}
+				<input type="range" min="0" max="1" step="0.05" bind:value={settings.smoothing} />
+			</label>
+			<label>
+				Prediction {settings.predictionMs} ms
+				<input type="range" min="0" max="200" step="10" bind:value={settings.predictionMs} />
+			</label>
+			<p class="hint">Jittery: more smoothing, less prediction. Laggy: the other way round.</p>
+		</fieldset>
+		<label>
+			Light
+			<select bind:value={settings.lightMode}>
+				<option value="lamp">Lamp at your head</option>
+				<option value="flashlight">Flashlight where you look</option>
+			</select>
+		</label>
+		{#if settings.lightMode === 'flashlight'}
+			<label>
+				Gaze sensitivity {settings.gazeGain.toFixed(1)}
+				<input type="range" min="0.3" max="3" step="0.1" bind:value={settings.gazeGain} />
+			</label>
+			<p class="hint">Look at the screen center and press c to calibrate where "straight ahead" is.</p>
+		{/if}
+				<label class="check"><input type="checkbox" bind:checked={settings.viewFollows} /> Room re-projects with your head (off: only the light follows)</label>
 		<label class="check"><input type="checkbox" bind:checked={settings.mouseMode} /> Mouse drives the head (wheel: distance)</label>
 		<label class="check"><input type="checkbox" bind:checked={settings.showVideo} /> Show camera preview</label>
 		<div class="row">
 			<button class="ghost" onclick={reset}>Reset settings</button>
 		</div>
-		<p class="hint">h hides this panel, f toggles fullscreen.</p>
+		<p class="hint">h hides this panel, f toggles fullscreen, c centers the view, t logs 5 s of raw tracking.</p>
 	{/if}
 </aside>
+
+{#if cardPx > 0}
+	<div class="card-overlay">
+		<p>
+			Hold a bank or ID card flat against the screen and resize the outline until it matches the
+			card's edges. Arrow keys fine-tune.
+		</p>
+		<div class="card" style:width="{cardPx}px" style:height="{(cardPx * CARD_MM.h) / CARD_MM.w}px"></div>
+		<input
+			type="range"
+			min="80"
+			max="1200"
+			step="0.5"
+			bind:value={cardPx}
+			style:width="min(600px, 80vw)"
+		/>
+		<p class="hint">≈ {Math.round(diagonalFromSpan(cardPx, CARD_MM.w) * 10) / 10}" diagonal for this screen</p>
+		<div class="row">
+			<button onclick={saveCard}>Save</button>
+			<button class="ghost" onclick={() => (cardPx = 0)}>Cancel</button>
+		</div>
+	</div>
+{/if}
 
 <style>
 	:global(html, body) {
@@ -281,6 +503,13 @@
 	.status {
 		margin: 6px 0 2px;
 		color: #b8b8c4;
+	}
+
+	.perf {
+		margin: 0 0 2px;
+		color: #8a8a96;
+		font-size: 11px;
+		font-variant-numeric: tabular-nums;
 	}
 
 	.head {
@@ -339,6 +568,10 @@
 		justify-content: flex-start;
 	}
 
+	input[type='range'] {
+		width: 110px;
+	}
+
 	input[type='number'] {
 		width: 64px;
 	}
@@ -375,6 +608,35 @@
 
 	.xyz input {
 		width: 44px;
+	}
+
+	.card-overlay {
+		position: fixed;
+		inset: 0;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 12px;
+		background: rgb(10 10 14 / 0.92);
+		text-align: center;
+	}
+
+	.card-overlay p {
+		max-width: 520px;
+		margin: 0;
+	}
+
+	.card {
+		border: 2px solid #4ef08a;
+		border-radius: 3.2%/5%;
+		box-sizing: border-box;
+	}
+
+	.warn {
+		margin: 2px 0;
+		color: #ffb35c;
+		font-size: 11px;
 	}
 
 	.hint {

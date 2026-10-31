@@ -9,3 +9,4 @@
 !/web/.yarn/releases
 !/web/.yarn/plugins
 .task/
+/web/dev-stats.log

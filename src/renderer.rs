@@ -19,6 +19,10 @@ pub struct Globals {
     pub light: [f32; 4],
     pub params: [f32; 4],
     pub room: [f32; 4],
+    /// Spotlight direction, `w = 1` when the light is a spotlight.
+    pub spot: [f32; 4],
+    /// Cosines of the spotlight's outer and inner half-angles.
+    pub cone: [f32; 4],
 }
 
 pub struct Renderer {

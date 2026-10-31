@@ -1,7 +1,8 @@
 //! Native build for quick iteration: the mouse stands in for the head, the wheel for distance.
 //! The browser build starts from the library's `#[wasm_bindgen(start)]` instead.
 //!
-//! `FACE_WINDOW_EYE=x,y,z` pins the eye (meters from the window center) instead.
+//! `FACE_WINDOW_EYE=x,y,z` pins the eye (meters from the window center) instead, and
+//! `FACE_WINDOW_FLASHLIGHT=1` swaps the lamp for the spotlight.
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> game_toolkit::prelude::Result<()> {
@@ -11,6 +12,9 @@ fn main() -> game_toolkit::prelude::Result<()> {
         if let [x, y, z] = p[..] {
             face_window::pin_eye(Some([x, y, z]));
         }
+    }
+    if std::env::var_os("FACE_WINDOW_FLASHLIGHT").is_some() {
+        face_window::set_flashlight(true);
     }
     face_window::run()
 }

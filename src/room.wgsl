@@ -11,6 +11,10 @@ struct Globals {
     params: vec4<f32>,
     // x half width, y half height, z depth, w light distance to the window plane.
     room: vec4<f32>,
+    // xyz spotlight direction, w 1 when the light is a spotlight.
+    spot: vec4<f32>,
+    // x cos of the outer half-angle, y cos of the inner one.
+    cone: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -102,7 +106,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Derivatives need uniform control flow, so the grid is computed everywhere and masked.
     let lines = mix(0.72, 1.0, grid(in.world, n, g.params.x));
     let albedo = in.color.rgb * mix(1.0, lines, in.color.a);
-    let direct = g.light.w * atten * shadow;
+    let cone = smoothstep(g.cone.x, g.cone.y, dot(-l, g.spot.xyz));
+    let spot = mix(1.0, cone, g.spot.w);
+    let direct = g.light.w * atten * shadow * spot;
     let rgb = albedo * (g.params.y + diffuse * direct) + vec3<f32>(spec * direct);
     return vec4<f32>(rgb, 1.0);
 }

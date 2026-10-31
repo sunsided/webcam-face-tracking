@@ -19,7 +19,7 @@ use game_toolkit::prelude::*;
 use crate::projection::{Vec3, off_axis};
 use crate::renderer::{Globals, Renderer};
 use crate::scene::Room;
-use crate::tracking::{Calibration, OneEuro};
+use crate::tracking::{Calibration, HeadFilter};
 
 /// Where the eye rests when nothing is tracked: centered, 60 cm from the screen.
 const DEFAULT_EYE: Vec3 = [0.0, 0.0, 0.6];
@@ -27,6 +27,15 @@ const DEFAULT_EYE: Vec3 = [0.0, 0.0, 0.6];
 const DEFAULT_METERS_PER_PIXEL: f32 = 0.345 / 1920.0;
 /// How long a lost face keeps its last position before easing back to [`DEFAULT_EYE`].
 const FACE_HOLD_SECS: f32 = 1.0;
+/// How far ahead of now the head is predicted, in seconds: roughly camera exposure plus
+/// readout, which the detection timestamp does not include.
+const LATENCY_LEAD: f64 = 0.035;
+/// How much of each new gaze sample is taken over; gaze from a webcam is noisy.
+const GAZE_SMOOTHING: f32 = 0.25;
+/// Flashlight beam radius where it meets the back wall, as a fraction of the room height.
+const SPOT_RADIUS: f32 = 0.45;
+/// The beam is fully bright out to this fraction of its radius, then fades.
+const SPOT_CORE: f32 = 0.55;
 /// The shadow frustum is this much wider than the window, so light reaches the walls next to
 /// the opening even when the light sits off to the side.
 const LIGHT_SPREAD: f32 = 1.8;
@@ -41,7 +50,33 @@ struct Shared {
     mouse_mode: bool,
     /// Fixed eye point overriding tracker and mouse (native screenshots, debugging).
     pinned_eye: Option<Vec3>,
+    /// Tracked eye position (x, y) that counts as straight in front of the window. A laptop
+    /// user's eyes usually sit well above the screen center, which physically means looking
+    /// down at the floor; recentering trades exactness for a nicer default view.
+    neutral: [f32; 2],
+    /// The last tracked eye point before recentering, for picking a new neutral.
+    raw_eye: Option<Vec3>,
+    /// GPU adapter and backend, for the page's diagnostics.
+    renderer_info: String,
+    /// `false` keeps the camera fixed in front of the window and moves only the light.
+    view_follows: bool,
+    /// Mirror the view's parallax per axis. Physically wrong, yet on Markus's setup the
+    /// mirrored re-projection felt more natural; the light always uses the real position.
+    view_invert: [bool; 2],
+    /// 0 (follow every measurement) to 1 (heavily smoothed).
+    smoothing: f32,
+    /// Longest extrapolation past the last measurement, in seconds. 0 turns prediction off.
+    max_lead: f32,
+    /// `true` turns the light into a spotlight aimed where the viewer looks.
+    flashlight: bool,
+    /// Gaze (world orientation) that counts as looking straight at the screen.
+    gaze_neutral: [f32; 2],
+    /// The smoothed gaze before subtracting the neutral, for picking a new neutral.
+    raw_gaze: Option<[f32; 2]>,
+    gaze_gain: f32,
     observation: Option<Observation>,
+    /// The newest observation, kept for calibration.
+    last_observation: Option<Observation>,
     face_lost: bool,
     /// The eye point used for the last frame, and whether it came from the tracker.
     head: (Vec3, bool),
@@ -51,6 +86,8 @@ struct Shared {
 struct Observation {
     left: [f32; 2],
     right: [f32; 2],
+    /// Iris offset from the eye center in eye widths, image orientation (`x` right, `y` down).
+    gaze: [f32; 2],
     image_size: [f32; 2],
     time_ms: f64,
 }
@@ -63,7 +100,19 @@ impl Default for Shared {
             light_offset: [0.0, 0.08, 0.0],
             mouse_mode: cfg!(not(target_arch = "wasm32")),
             pinned_eye: None,
+            neutral: [0.0, 0.0],
+            raw_eye: None,
+            renderer_info: String::new(),
+            view_follows: true,
+            view_invert: [true, true],
+            smoothing: 0.5,
+            max_lead: 0.08,
+            flashlight: false,
+            gaze_neutral: [0.0, 0.0],
+            raw_gaze: None,
+            gaze_gain: tracking::GAZE_GAIN,
             observation: None,
+            last_observation: None,
             face_lost: false,
             head: (DEFAULT_EYE, false),
         }
@@ -82,11 +131,16 @@ struct WindowRoom {
     renderer: Renderer,
     mesh: scene::Mesh,
     room: Room,
-    filter: OneEuro,
-    last_obs_ms: Option<f64>,
+    filter: HeadFilter,
     since_face: f32,
     eye: Vec3,
+    /// Where the scene is viewed from: the eye, or a fixed point when only the light follows.
+    view: Vec3,
     light: Vec3,
+    /// Smoothed gaze in world orientation, before the neutral is subtracted.
+    gaze: Option<[f32; 2]>,
+    /// Unit direction of the spotlight, `None` for the plain lamp.
+    spot: Option<Vec3>,
     mouse_z: f32,
     time: f32,
     frames: u32,
@@ -97,15 +151,19 @@ impl Game for WindowRoom {
         let room = Room::for_window(window_size(ctx));
         let mesh = scene::build(&room, 0.0);
         let renderer = Renderer::new(&ctx.gfx, &mesh);
+        let info = ctx.gfx.device().adapter_info();
+        with_shared(|s| s.renderer_info = format!("{:?} {}", info.backend, info.name));
         Ok(Self {
             renderer,
             mesh,
             room,
-            filter: OneEuro::new(1.2, 3.0),
-            last_obs_ms: None,
+            filter: HeadFilter::default(),
             since_face: f32::INFINITY,
             eye: DEFAULT_EYE,
+            view: DEFAULT_EYE,
             light: DEFAULT_EYE,
+            gaze: None,
+            spot: None,
             mouse_z: DEFAULT_EYE[2],
             time: 0.0,
             frames: 0,
@@ -148,21 +206,44 @@ impl Game for WindowRoom {
 
         if lost {
             self.filter.reset();
-            self.last_obs_ms = None;
         }
         let mut tracked = false;
+        if let Some(o) = obs {
+            // The camera faces the viewer, so image left is the viewer's right.
+            let g = [-o.gaze[0], -o.gaze[1]];
+            let smoothed = self.gaze.map_or(g, |p| {
+                [
+                    p[0] + (g[0] - p[0]) * GAZE_SMOOTHING,
+                    p[1] + (g[1] - p[1]) * GAZE_SMOOTHING,
+                ]
+            });
+            self.gaze = Some(smoothed);
+            with_shared(|s| s.raw_gaze = Some(smoothed));
+        }
         if let Some(o) = obs
             && let Some(p) = tracking::eye_point(o.left, o.right, o.image_size, &cal)
         {
-            let obs_dt = self
-                .last_obs_ms
-                .map_or(1.0 / 30.0, |t| ((o.time_ms - t) / 1000.0) as f32);
-            self.last_obs_ms = Some(o.time_ms);
-            self.eye = self.filter.filter(p, obs_dt);
+            self.filter.update(p, o.time_ms / 1000.0);
             self.since_face = 0.0;
             tracked = true;
         } else {
             self.since_face += dt;
+        }
+        // Between camera frames (and ahead of them, to cover capture and detection latency)
+        // the head moves on at its estimated velocity.
+        let (smoothing, max_lead) = with_shared(|s| (s.smoothing, s.max_lead));
+        let accel = 10f32.powf(1.0 - 3.0 * smoothing);
+        self.filter.acceleration_variance = [accel, accel, accel * 0.5];
+        if self.since_face <= FACE_HOLD_SECS
+            && let Some(p) = self
+                .filter
+                .predict(now_ms() / 1000.0 + LATENCY_LEAD, max_lead)
+        {
+            let neutral = with_shared(|s| {
+                s.raw_eye = Some(p);
+                s.neutral
+            });
+            self.eye = [p[0] - neutral[0], p[1] - neutral[1], p[2]];
         }
 
         if let Some(p) = pinned {
@@ -191,6 +272,46 @@ impl Game for WindowRoom {
             self.eye[1] + light_offset[1],
             (self.eye[2] + light_offset[2]).max(projection::MIN_EYE_DISTANCE * 2.0),
         ];
+        let (view_follows, view_invert, flashlight, gaze_neutral, gaze_gain) = with_shared(|s| {
+            (
+                s.view_follows,
+                s.view_invert,
+                s.flashlight,
+                s.gaze_neutral,
+                s.gaze_gain,
+            )
+        });
+        let sign = |invert: bool| if invert { -1.0 } else { 1.0 };
+        self.view = if view_follows {
+            [
+                self.eye[0] * sign(view_invert[0]),
+                self.eye[1] * sign(view_invert[1]),
+                self.eye[2],
+            ]
+        } else {
+            DEFAULT_EYE
+        };
+        // The flashlight aims along the gaze ray, at the point where it meets the back wall.
+        self.spot = match self.gaze {
+            Some(g) if flashlight && !mouse_mode => {
+                let g = [g[0] - gaze_neutral[0], g[1] - gaze_neutral[1]];
+                let hit = tracking::gaze_hit(self.eye, g, gaze_gain, -self.room.depth);
+                let d = [
+                    hit[0] - self.light[0],
+                    hit[1] - self.light[1],
+                    hit[2] - self.light[2],
+                ];
+                let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+                Some([d[0] / len, d[1] / len, d[2] / len])
+            }
+            // With the mouse driving, aim from the head through the window center.
+            _ if flashlight => {
+                let l = self.light;
+                let len = (l[0] * l[0] + l[1] * l[1] + l[2] * l[2]).sqrt().max(1e-6);
+                Some([-l[0] / len, -l[1] / len, -l[2] / len])
+            }
+            _ => None,
+        };
         let tracked_now = tracked || (!mouse_mode && self.since_face <= FACE_HOLD_SECS);
         with_shared(|s| s.head = (self.eye, tracked_now));
 
@@ -207,9 +328,9 @@ impl Game for WindowRoom {
             half_h,
             depth,
         } = self.room;
-        let far = self.eye[2] + depth + 1.0;
+        let far = self.view[2] + depth + 1.0;
         let globals = Globals {
-            view_proj: off_axis(self.eye, half_w, half_h, 0.02, far),
+            view_proj: off_axis(self.view, half_w, half_h, 0.02, far),
             light_view_proj: off_axis(
                 self.light,
                 half_w * LIGHT_SPREAD,
@@ -217,7 +338,7 @@ impl Game for WindowRoom {
                 0.02,
                 self.light[2] + depth + 1.0,
             ),
-            eye: [self.eye[0], self.eye[1], self.eye[2], 1.0],
+            eye: [self.view[0], self.view[1], self.view[2], 1.0],
             light: [self.light[0], self.light[1], self.light[2], 1.8],
             params: [
                 self.room.grid(),
@@ -226,8 +347,41 @@ impl Game for WindowRoom {
                 depth * 0.004,
             ],
             room: [half_w, half_h, depth, self.light[2]],
+            spot: self
+                .spot
+                .map_or([0.0, 0.0, -1.0, 0.0], |d| [d[0], d[1], d[2], 1.0]),
+            cone: self.spot_cone(),
         };
         self.renderer.draw(&ctx.gfx, frame, &self.mesh, &globals);
+    }
+}
+
+/// Milliseconds on the clock the page timestamps observations with (`performance.now()`).
+#[cfg(target_arch = "wasm32")]
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map_or(0.0, |p| p.now())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn now_ms() -> f64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
+        * 1000.0
+}
+
+impl WindowRoom {
+    /// Cosines of the flashlight's outer and inner half-angles, sized so the beam covers a
+    /// similar share of the back wall however far away the viewer sits.
+    fn spot_cone(&self) -> [f32; 4] {
+        let dist = (self.light[2] + self.room.depth).max(0.05);
+        let outer = (SPOT_RADIUS * self.room.half_h * 2.0 / dist).atan();
+        [outer.cos(), (outer * SPOT_CORE).cos(), 0.0, 0.0]
     }
 }
 
@@ -245,6 +399,11 @@ fn window_size(ctx: &Context) -> [f32; 2] {
 /// Pin the eye to a fixed point, or `None` to follow the tracker or mouse again.
 pub fn pin_eye(eye: Option<Vec3>) {
     with_shared(|s| s.pinned_eye = eye);
+}
+
+/// Light the room with a spotlight instead of a lamp (see `web::set_flashlight`).
+pub fn set_flashlight(on: bool) {
+    with_shared(|s| s.flashlight = on);
 }
 
 /// Start the app. Natively this blocks until the window closes; on the web it returns at once

@@ -288,7 +288,7 @@
 <aside class:closed={!panelOpen}>
 	<header>
 		<strong>face-window</strong>
-		<button class="ghost" onclick={() => (panelOpen = !panelOpen)} title="Toggle panel (h)">
+		<button class="ghost" onclick={() => (panelOpen = !panelOpen)} data-tip="Toggle panel (h)" aria-label="Toggle panel (h)">
 			{panelOpen ? '–' : '+'}
 		</button>
 	</header>
@@ -309,7 +309,7 @@
 			{:else}
 				<button onclick={startCamera} disabled={!ready}>Start camera</button>
 			{/if}
-			<button onclick={fullscreen} title="Fullscreen (f)">Fullscreen</button>
+			<button onclick={fullscreen} data-tip="Fullscreen (f)">Fullscreen</button>
 		</div>
 
 		{#if cameras.length > 1}
@@ -335,7 +335,7 @@
 		<fieldset>
 			<legend>Calibration</legend>
 			<div class="row">
-				<button onclick={centerView} disabled={!cameraOn} title="Sit as usual, then click (c)">Center view here</button>
+				<button onclick={centerView} disabled={!cameraOn} data-tip="Sit as usual, then click (c)">Center view here</button>
 				<button class="ghost" onclick={() => (settings.neutral = [0, 0, 0, 0])}>Physical</button>
 			</div>
 			<p class="hint">
@@ -352,7 +352,7 @@
 				/>
 			</label>
 			<div class="row">
-				<button onclick={openCard} title="Match a bank card against the screen">Measure with a card</button>
+				<button onclick={openCard} data-tip="Match a bank card against the screen">Measure with a card</button>
 				{#if !measured}<span class="hint">guessed</span>{/if}
 			</div>
 			{#if dpiWarning}
@@ -368,7 +368,7 @@
 			<label>Camera FOV (°) <input type="number" step="0.5" bind:value={settings.cameraFovDeg} /></label>
 			<div class="row">
 				<label>I sit <input type="number" step="1" bind:value={distanceCm} /> cm away</label>
-				<button onclick={calibrateDistance} disabled={!cameraOn} title="Sets the camera FOV">Calibrate</button>
+				<button onclick={calibrateDistance} disabled={!cameraOn} data-tip="Sets the camera FOV">Calibrate</button>
 			</div>
 			{#if calibrateNote}<p class="hint">{calibrateNote}</p>{/if}
 			<label>Camera above screen (cm) <input type="number" step="0.5" bind:value={settings.cameraAboveCm} /></label>
@@ -549,6 +549,42 @@
 		color: #fff;
 		font: inherit;
 		cursor: pointer;
+	}
+
+	/* Our own tooltips: Chrome on X11 places native `title` tooltips at the screen's top left
+	   until the mouse moves. */
+	button[data-tip] {
+		position: relative;
+	}
+
+	button[data-tip]::after {
+		content: attr(data-tip);
+		position: absolute;
+		top: calc(100% + 6px);
+		left: 50%;
+		transform: translateX(-50%);
+		z-index: 10;
+		padding: 3px 7px;
+		border-radius: 4px;
+		background: rgb(0 0 0 / 0.85);
+		color: #e8e8ec;
+		font-size: 11px;
+		white-space: nowrap;
+		pointer-events: none;
+		opacity: 0;
+		transition: opacity 0.1s;
+	}
+
+	/* The panel toggle sits at the right edge, where a centered tip would be clipped. */
+	header button[data-tip]::after {
+		left: auto;
+		right: 0;
+		transform: none;
+	}
+
+	button[data-tip]:hover::after {
+		opacity: 1;
+		transition-delay: 0.4s;
 	}
 
 	button:disabled {

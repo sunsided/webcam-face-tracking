@@ -1,0 +1,76 @@
+version: '3'
+
+# Copy to Taskfile.yaml for local overrides; go-task picks Taskfile.yaml over this file.
+
+vars:
+  WASM_OUT: web/src/lib/wasm
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  wasm:
+    desc: Build the renderer to WASM (release) into the web app
+    sources: [src/**/*, Cargo.toml, Cargo.lock]
+    generates: ['{{.WASM_OUT}}/face_window_bg.wasm']
+    cmds:
+      - wasm-pack build --release --target web --no-pack --out-dir {{.WASM_OUT}} --out-name face_window
+
+  wasm:dev:
+    desc: Build the renderer to WASM (debug, faster to compile, bigger and slower)
+    cmds:
+      - wasm-pack build --dev --target web --no-pack --out-dir {{.WASM_OUT}} --out-name face_window
+
+  web:install:
+    desc: Install the web app's dependencies and vendor the MediaPipe assets
+    dir: web
+    sources: [package.json, yarn.lock]
+    cmds:
+      - corepack yarn install
+      - corepack yarn mediapipe
+
+  dev:
+    desc: Build the WASM renderer and serve the web app with Vite (http://localhost:5173)
+    deps: [wasm, web:install]
+    dir: web
+    cmds:
+      - corepack yarn dev
+
+  build:
+    desc: Static production build of the web app into web/build
+    deps: [wasm, web:install]
+    dir: web
+    cmds:
+      - corepack yarn build
+
+  preview:
+    desc: Serve the production build (http://localhost:4173)
+    deps: [build]
+    dir: web
+    cmds:
+      - corepack yarn preview
+
+  run:
+    desc: Run natively; the mouse stands in for the head, the wheel for distance
+    cmds:
+      - cargo run --release
+
+  test:
+    desc: Rust unit tests (projection, tracking, scene)
+    cmds:
+      - cargo test
+
+  lint:
+    desc: Clippy (native and wasm32) and svelte-check
+    deps: [web:install]
+    cmds:
+      - cargo clippy --all-targets -- -D warnings
+      - cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
+      - cd web && corepack yarn check
+
+  fmt:
+    desc: Format the Rust code
+    cmds:
+      - cargo fmt

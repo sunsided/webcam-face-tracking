@@ -1,0 +1,11 @@
+/target
+/web/node_modules
+/web/.svelte-kit
+/web/build
+/web/src/lib/wasm/
+/web/static/mediapipe/
+/web/.yarn/*
+!/web/.yarn/patches
+!/web/.yarn/releases
+!/web/.yarn/plugins
+.task/

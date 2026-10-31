@@ -1,0 +1,44 @@
+[package]
+name = "face-window"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "EUPL-1.2"
+authors = ["Markus Mayer"]
+description = "A 3D room seen through the screen as a window, re-projected from a webcam-tracked head position."
+publish = false
+
+[lib]
+# cdylib for the browser (wasm-bindgen), rlib for the native binary and tests.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "face-window"
+path = "src/main.rs"
+
+[dependencies]
+game-toolkit = "0.5"
+bytemuck = { version = "1.25", features = ["derive"] }
+log = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+env_logger = "0.11"
+
+[lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+uninlined_format_args = "warn"
+semicolon_if_nothing_returned = "warn"
+
+# Unoptimized wgpu/naga make debug builds crawl; optimize dependencies only.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
